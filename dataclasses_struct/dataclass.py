@@ -2,6 +2,7 @@ import dataclasses
 import sys
 from collections.abc import Generator, Iterator
 from struct import Struct
+from types import GenericAlias
 from typing import (
     Annotated,
     Any,
@@ -93,6 +94,8 @@ class _DataclassStructInternal(Generic[T]):
             attr = getattr(obj, fieldname)
             if is_dataclass_struct(attr):
                 attrs.extend(attr.__dataclass_struct__._flattened_attrs(attr))
+            elif isinstance(attr, list):
+                attrs.extend(attr)
             else:
                 attrs.append(attr)
         return attrs
@@ -194,18 +197,45 @@ class _NestedField(Field):
         return self.field_type.__dataclass_struct__.format[1:]
 
 
-def _validate_and_parse_field(
-    cls: type,
-    name: str,
-    field_type: type,
-    is_native: bool,
-    validate_defaults: bool,
-    mode: str,
-) -> tuple[str, type]:
-    """
-    name is the name of the attribute, f is its type annotation.
-    """
+class _FixedSizeArrayField(Field[list[T]]):
+    field_type = type[DataclassStructProtocol]
 
+    def __init__(self, cls: type[DataclassStructProtocol], n: int):
+        if not isinstance(n, int) or n < 1:
+            raise ValueError("fixed size array length must be positive non-zero int")
+
+        if len(cls.__args__) != 1:
+            raise ValueError
+
+        self.field_type = cls
+        self.n = n
+
+    def format(self) -> str:
+        value_type, _, _, _ = _resolve_field(self.field_type.__args__[0], "TODO replace")
+
+        if is_dataclass_struct(value_type):
+            return value_type.__dataclass_struct__.format()[1:] * self.n
+        elif isinstance(value_type, Field):
+            return value_type.format() * self.n
+        else:
+            type_ = builtin_fields.get(value_type)
+            if type_ is None:
+                raise ValueError(f"fixed size array value type is not a dataclass struct or a builtin type: {value_type}")
+
+            return type_.format() * self.n
+
+    def validate_default(self, val: list[T]) -> None:
+        if len(val) > self.n:
+            raise ValueError(f"fixed size array cannot be longer than {self.n} elements")
+
+    def __repr__(self) -> str:
+        return f"{super().__repr__()}({self.n})"
+
+
+def _resolve_field(
+    field_type: type,
+    mode: str,
+) -> tuple[Field, type, int, int]:
     if get_origin(field_type) == Annotated:
         # The types defined in .types (e.g. U32, F32, etc.) are of the form:
         #     Annotated[<builtin type>, Field(<field args>)]
@@ -254,13 +284,31 @@ def _validate_and_parse_field(
                 raise TypeError(f"type not supported: {field_type}")
 
     if not isinstance(field, Field):
-        if issubclass(type_, bytes):
+        if type(type_) is GenericAlias:
+            field = _FixedSizeArrayField(type_, field)
+        elif issubclass(type_, bytes):
             # Annotated[bytes, <positive non-zero integer>] is a byte array
             field = _BytesField(field)
         else:
             raise TypeError(f"invalid field annotation: {field!r}")
     elif not issubclass(type_, field.field_type):
         raise TypeError(f"type {type_} not supported for field: {field}")
+
+    return field, type_, pad_before, pad_after
+
+
+def _validate_and_parse_field(
+    cls: type,
+    name: str,
+    field_type: type,
+    is_native: bool,
+    validate_defaults: bool,
+    mode: str,
+) -> tuple[str, type]:
+    """
+    name is the name of the attribute, f is its type annotation.
+    """
+    field, type_, pad_before, pad_after = _resolve_field(field_type, mode)
 
     if is_native:
         if not field.is_native:
